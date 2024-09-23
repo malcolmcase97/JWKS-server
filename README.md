@@ -34,4 +34,4 @@ To run tests, use:
 npm test
 
 To check test coverage, use:
-npm run coverage
+npm test -- --coverage

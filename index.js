@@ -33,7 +33,13 @@ function getValidKeys() {
 // JWKS endpoint
 app.get('/jwks', (req, res) => {
     try {
-        const validKeys = getValidKeys(); // Get valid keys
+        const validKeys = getValidKeys(); 
+        console.log('Valid keys found:', validKeys); // Log valid keys
+        if (validKeys.length === 0) {
+            console.log('No valid keys found');
+            return res.status(404).json({ error: 'No valid keys found' });
+        }
+        
         const responseKeys = validKeys.map(key => {
             const publicKey = forge.pki.publicKeyFromPem(key.publicKey);
             return {
@@ -45,9 +51,11 @@ app.get('/jwks', (req, res) => {
                 e: publicKey.e.toString(16)
             };
         });
-        res.json({ keys: responseKeys }); // Send keys as response
+        console.log('Response keys:', responseKeys); // Log response keys
+        res.json({ keys: responseKeys });
     } catch (error) {
-        res.status(500).send('Internal Server Error'); // Error handling
+        console.error('Error retrieving keys:', error); // Log error details
+        res.status(500).send('Internal Server Error');
     }
 });
 
@@ -56,12 +64,19 @@ app.post('/auth', (req, res) => {
     const expired = req.query.expired === 'true';
     let keyToUse;
 
+    console.log(`Auth request received, expired: ${expired}`);
     if (expired) {
         keyToUse = keys.find(key => key.expiresAt <= new Date());
-        if (!keyToUse) return res.status(400).json({ error: 'No expired keys available' });
+        if (!keyToUse) {
+            console.log('No expired keys available');
+            return res.status(400).json({ error: 'No expired keys available' });
+        }
     } else {
         const validKeys = getValidKeys();
-        if (validKeys.length === 0) return res.status(500).json({ error: 'No valid keys available' });
+        if (validKeys.length === 0) {
+            console.log('No valid keys available');
+            return res.status(400).json({ error: 'No valid keys available' });
+        }
         keyToUse = validKeys[0];
     }
 
@@ -78,7 +93,8 @@ app.post('/auth', (req, res) => {
         keyid: keyToUse.kid,
     });
 
-    res.json({ token }); // Send token
+    console.log('Generated token with kid:', keyToUse.kid); // Log generated token details
+    res.json({ token });
 });
 
 // Start server

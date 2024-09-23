@@ -35,4 +35,35 @@ describe('JWKS Server', () => {
     expect(decodedToken.payload.exp).toBeLessThan(Math.floor(Date.now() / 1000)); // Token should be expired
   });
 
+  test('should return 404 for /jwks when no valid keys exist', async () => {
+    // Clear keys to simulate no valid keys
+    keys = []; // Ensure `keys` is properly scoped or imported if necessary
+  
+    const res = await request(app).get('/jwks');
+    expect(res.status).toBe(404);
+    expect(res.body).toHaveProperty('error', 'No valid keys found');
+  });
+  
+  test('should return 400 for /auth when no valid keys exist', async () => {
+    // Clear keys to simulate no valid keys
+    keys = []; // Ensure `keys` is properly scoped or imported if necessary
+  
+    const res = await request(app).post('/auth');
+    expect(res.status).toBe(400);
+    expect(res.body).toHaveProperty('error', 'No valid keys available for authentication');
+  });
+  
+  test('should return 400 for /auth when only expired keys exist', async () => {
+    // Generate an expired key for testing
+    generateKeyPair(true); // Ensure this function is available and correctly generates expired keys
+  
+    const res = await request(app).post('/auth');
+    expect(res.status).toBe(400);
+    expect(res.body).toHaveProperty('error', 'No valid keys available for authentication');
+  });
+  
 });
+
+
+
+
