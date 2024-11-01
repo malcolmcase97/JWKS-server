@@ -15,6 +15,7 @@ This project implements a JWKS server using Node.js and Express.
   - Express: for building the web server
   - node-forge: for handling RSA key generation and PEM formatting
   - Jest: for testing
+  - ESLint: for linting (not including in repo)
 
 ## Setup
 1. Clone the repository:

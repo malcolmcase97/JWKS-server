@@ -1,7 +1,7 @@
-export default {
+module.exports = {
     testEnvironment: 'node',
-    transform: {
-      '^.+\\.js$': 'babel-jest',
-    },
+    coverageDirectory: 'coverage',
+    collectCoverage: true,
+    collectCoverageFrom: ['**/*.js', '!**/node_modules/**', '!**/coverage/**', '!**/jest.config.js'],
   };
   

@@ -1,69 +1,83 @@
-import request from 'supertest';
-import app from '../index.js';  // Adjust the path if necessary
-import jwt from 'jsonwebtoken';
+const request = require('supertest');
+const { app, server, storeKeysAtStartup } = require('../server'); // Adjust the path according to your project structure
+const sqlite3 = require('sqlite3').verbose();
 
-describe('JWKS Server', () => {
+// Create a fresh SQLite database for testing
+const testDbFilePath = './totally_not_my_privateKeys.db';
+const db = new sqlite3.Database(testDbFilePath);
 
-  test('should return valid public keys from /jwks', async () => {
-    const res = await request(app).get('/jwks');
-    expect(res.status).toBe(200);
-    expect(res.body.keys).toBeInstanceOf(Array);
-    res.body.keys.forEach(key => {
-      expect(key).toHaveProperty('kid');
-      expect(key.kty).toBe('RSA');
+// Function to reset the test database
+async function resetDatabase() {
+  await new Promise((resolve, reject) => {
+    db.serialize(() => {
+      db.run(`DROP TABLE IF EXISTS keys`, (err) => {
+        if (err) reject(err);
+        db.run(
+          `CREATE TABLE IF NOT EXISTS keys (
+            kid INTEGER PRIMARY KEY AUTOINCREMENT,
+            key BLOB NOT NULL,
+            exp INTEGER NOT NULL
+          )`,
+          (err) => {
+            if (err) reject(err);
+            resolve();
+          }
+        );
+      });
     });
   });
+}
 
-  test('should return a valid JWT from /auth', async () => {
-    const res = await request(app).post('/auth');
-    expect(res.status).toBe(200);
-    expect(typeof res.body.token).toBe('string');
-    
-    const decodedToken = jwt.decode(res.body.token, { complete: true });
-    expect(decodedToken).toHaveProperty('header');
-    expect(decodedToken.header).toHaveProperty('kid');
-  });
-
-  test('should return an expired JWT when expired=true', async () => {
-    const res = await request(app).post('/auth?expired=true');
-    expect(res.status).toBe(200);
-    expect(typeof res.body.token).toBe('string');
-    
-    const decodedToken = jwt.decode(res.body.token, { complete: true });
-    expect(decodedToken).toHaveProperty('header');
-    expect(decodedToken.payload).toHaveProperty('exp');
-    expect(decodedToken.payload.exp).toBeLessThan(Math.floor(Date.now() / 1000)); // Token should be expired
-  });
-
-  test('should return 404 for /jwks when no valid keys exist', async () => {
-    // Clear keys to simulate no valid keys
-    keys = []; // Ensure `keys` is properly scoped or imported if necessary
-  
-    const res = await request(app).get('/jwks');
-    expect(res.status).toBe(404);
-    expect(res.body).toHaveProperty('error', 'No valid keys found');
-  });
-  
-  test('should return 400 for /auth when no valid keys exist', async () => {
-    // Clear keys to simulate no valid keys
-    keys = []; // Ensure `keys` is properly scoped or imported if necessary
-  
-    const res = await request(app).post('/auth');
-    expect(res.status).toBe(400);
-    expect(res.body).toHaveProperty('error', 'No valid keys available for authentication');
-  });
-  
-  test('should return 400 for /auth when only expired keys exist', async () => {
-    // Generate an expired key for testing
-    generateKeyPair(true); // Ensure this function is available and correctly generates expired keys
-  
-    const res = await request(app).post('/auth');
-    expect(res.status).toBe(400);
-    expect(res.body).toHaveProperty('error', 'No valid keys available for authentication');
-  });
-  
+// Before all tests, reset the database
+beforeAll(async () => {
+  await resetDatabase();
+  await storeKeysAtStartup(); // Ensure to call your function that stores keys
 });
 
+// After all tests, close the database connection and server
+afterAll((done) => {
+  // Drop the keys table after tests
+  db.serialize(() => {
+    db.run(`DROP TABLE IF EXISTS keys`, (err) => {
+      if (err) console.error(err);
+      db.close(); // Close the database connection
+      server.close(done); // Close the server
+    });
+  });
+});
 
+// Test cases
+describe('JWKS Server', () => {
+  test('POST /auth - valid key', async () => {
+    const response = await request(app).post('/auth');
+    expect(response.statusCode).toBe(200);
+    expect(response.text).toMatch(/^eyJ/); // Check if the response is a JWT
+  });
 
+  test('POST /auth - expired key', async () => {
+    const response = await request(app).post('/auth?expired=true');
+    expect(response.statusCode).toBe(200);
+    expect(response.text).toMatch(/^eyJ/); // Check if the response is a JWT
+  });
 
+  test('GET /.well-known/jwks.json - valid keys', async () => {
+    const response = await request(app).get('/.well-known/jwks.json');
+    expect(response.statusCode).toBe(200);
+    expect(response.body.keys).toBeInstanceOf(Array);
+    expect(response.body.keys.length).toBeGreaterThan(0); // Ensure there are valid keys
+  });
+
+  test('GET /.well-known/jwks.json - no valid keys', async () => {
+    // Manually remove all valid keys from the database for this test
+    await new Promise((resolve, reject) => {
+      db.run(`DELETE FROM keys`, (err) => {
+        if (err) reject(err);
+        resolve();
+      });
+    });
+
+    const response = await request(app).get('/.well-known/jwks.json');
+    expect(response.statusCode).toBe(200);
+    expect(response.body.keys).toEqual([]); // No valid keys should return an empty array
+  });
+});

@@ -1,3 +1,4 @@
-node_modules/
 /coverage
-.env
+totally_not_my_privateKeys.db
+eslint.config.mjs
+gradebot.exe
