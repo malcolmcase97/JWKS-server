@@ -1,33 +1,78 @@
+require('dotenv').config();
 const express = require('express');
 const jwt = require('jsonwebtoken');
 const jose = require('node-jose');
 const sqlite3 = require('sqlite3').verbose();
+const crypto = require('crypto');
+const { v4: uuidv4 } = require('uuid');
+const argon2 = require('argon2');
+const rateLimit = require('express-rate-limit');
 
+// Initialize Express
 const app = express();
+app.use(express.json()); // Support JSON request bodies
+
 const port = 8080;
 const dbFilePath = './totally_not_my_privateKeys.db';
+
+// AES Encryption Key from Environment Variable
+const AES_KEY = process.env.NOT_MY_KEY;
+
+if (!AES_KEY || AES_KEY.length !== 32) {
+  throw new Error('NOT_MY_KEY environment variable must be a 32-byte key');
+}
+
+// AES Encryption Helper Functions
+function encryptKey(plaintext) {
+  const iv = crypto.randomBytes(16);
+  const cipher = crypto.createCipheriv('aes-256-cbc', AES_KEY, iv);
+  const encrypted = Buffer.concat([cipher.update(plaintext), cipher.final()]);
+  return Buffer.concat([iv, encrypted]).toString('base64');
+}
+
+function decryptKey(ciphertext) {
+  const buffer = Buffer.from(ciphertext, 'base64');
+  const iv = buffer.slice(0, 16);
+  const encrypted = buffer.slice(16);
+  const decipher = crypto.createDecipheriv('aes-256-cbc', AES_KEY, iv);
+  return Buffer.concat([decipher.update(encrypted), decipher.final()]).toString('utf8');
+}
 
 // Initialize SQLite Database
 const db = new sqlite3.Database(dbFilePath, (err) => {
   if (err) {
     console.error('Error opening database:', err);
   } else {
+    // Create necessary tables
     db.run(
       `CREATE TABLE IF NOT EXISTS keys (
         kid INTEGER PRIMARY KEY AUTOINCREMENT,
         key BLOB NOT NULL,
         exp INTEGER NOT NULL
-      )`,
-      (err) => {
-        if (err) {
-          console.error('Error creating keys table:', err);
-        }
-      }
+      )`
+    );
+    db.run(
+      `CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT NOT NULL UNIQUE,
+        password_hash TEXT NOT NULL,
+        email TEXT UNIQUE,
+        date_registered TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        last_login TIMESTAMP
+      )`
+    );
+    db.run(
+      `CREATE TABLE IF NOT EXISTS auth_requests (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT NOT NULL,
+        success INTEGER NOT NULL,
+        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )`
     );
   }
 });
 
-// Generate and store keys at startup
+// Store keys at startup
 async function storeKeysAtStartup() {
   const validKeyPair = await jose.JWK.createKey('RSA', 2048, { alg: 'RS256', use: 'sig' });
   const expiredKeyPair = await jose.JWK.createKey('RSA', 2048, { alg: 'RS256', use: 'sig' });
@@ -35,17 +80,25 @@ async function storeKeysAtStartup() {
   const validExpiration = Math.floor(Date.now() / 1000) + 3600; // 1 hour from now
   const expiredExpiration = Math.floor(Date.now() / 1000) - 3600; // 1 hour ago
 
-  console.log('Storing valid key:', validKeyPair.toPEM(true));
-  console.log('Storing expired key:', expiredKeyPair.toPEM(true));
+  const encryptedValidKey = encryptKey(validKeyPair.toPEM(true));
+  const encryptedExpiredKey = encryptKey(expiredKeyPair.toPEM(true));
 
-  db.run(`INSERT INTO keys (key, exp) VALUES (?, ?)`, [validKeyPair.toPEM(true), validExpiration]);
-  db.run(`INSERT INTO keys (key, exp) VALUES (?, ?)`, [expiredKeyPair.toPEM(true), expiredExpiration]);
+  db.run(`INSERT INTO keys (key, exp) VALUES (?, ?)`, [encryptedValidKey, validExpiration]);
+  db.run(`INSERT INTO keys (key, exp) VALUES (?, ?)`, [encryptedExpiredKey, expiredExpiration]);
 }
 
-// Call storeKeysAtStartup at program start
-storeKeysAtStartup();
+// Rate limiter for authentication
+const authRateLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1-minute window
+  max: 5, // Limit each IP to 5 requests per minute
+  message: {
+    error: 'Too many authentication attempts. Please try again later.',
+  },
+  standardHeaders: true, // Return rate limit info in `RateLimit-*` headers
+  legacyHeaders: false, // Disable the `X-RateLimit-*` headers
+});
 
-// Helper to fetch key from database based on expiration requirement
+// Fetch Key from Database
 function fetchKeyFromDatabase(expired, callback) {
   const currentTime = Math.floor(Date.now() / 1000);
   const query = expired
@@ -59,61 +112,137 @@ function fetchKeyFromDatabase(expired, callback) {
     } else if (!row) {
       callback(new Error('No appropriate key found'), null);
     } else {
-      callback(null, row);
+      try {
+        const decryptedKey = decryptKey(row.key);
+        callback(null, { ...row, key: decryptedKey });
+      } catch (decryptErr) {
+        console.error('Error decrypting key:', decryptErr);
+        callback(decryptErr, null);
+      }
     }
   });
 }
 
-// POST:/auth endpoint
-app.post('/auth', (req, res) => {
-  const expired = req.query.expired === 'true';
+// Log Authentication Request
+function logAuthRequest(username, success) {
+  return new Promise((resolve, reject) => {
+    db.run(
+      `INSERT INTO auth_requests (username, success) VALUES (?, ?)`,
 
-  fetchKeyFromDatabase(expired, (err, keyRow) => {
-    if (err || !keyRow) {
-      return res.status(400).json({ error: expired ? 'No expired keys available' : 'No valid keys available' });
-    }
-
-    // Define payload and JWT options
-    const payload = { user: 'sampleUser', iat: Math.floor(Date.now() / 1000) };
-    const tokenExpiry = expired ? Math.floor(Date.now() / 1000) - 60 : Math.floor(Date.now() / 1000) + 3600;
-    const options = {
-      algorithm: 'RS256',
-      header: { typ: 'JWT', alg: 'RS256', kid: keyRow.kid },
-      expiresIn: tokenExpiry - payload.iat,
-    };
-
-    // Sign the JWT
-    const token = jwt.sign(payload, keyRow.key, options);
-    res.send(token);
-  });
-});
-
-// GET:/.well-known/jwks.json endpoint
-app.get('/.well-known/jwks.json', (req, res) => {
-  const currentTime = Math.floor(Date.now() / 1000);
-  const query = `SELECT kid, key FROM keys WHERE exp > ?`;
-
-  db.all(query, [currentTime], async (err, rows) => {
-    if (err) {
-      console.error('Error fetching keys for JWKS:', err);
-      return res.status(500).json({ error: 'Internal Server Error' });
-    }
-
-    const keys = await Promise.all(
-      rows.map(async (row) => {
-        const jwk = await jose.JWK.asKey(row.key, 'pem');
-        return jwk.toJSON();
-      })
+      [username, success ? 1 : 0],
+      function (err) {
+        if (err) {
+          console.error('Error logging authentication request:', err);
+          reject(err);
+        } else {
+          resolve();
+        }
+      }
     );
-
-    res.json({ keys });
   });
+}
+
+// User Registration Endpoint
+app.post('/register', async (req, res) => {
+  const { username, email } = req.body;
+
+  if (!username || !email) {
+    return res.status(400).json({ error: 'Username and email are required' });
+  }
+
+  try {
+    // Generate secure password
+    const password = uuidv4();
+
+    // Hash the password with Argon2
+    const passwordHash = await argon2.hash(password, {
+      timeCost: 3,
+      memoryCost: 2 ** 16, // 64 MiB
+      parallelism: 1,
+      type: argon2.argon2id,
+    });
+
+    // Insert user into the database
+    db.run(
+      `INSERT INTO users (username, password_hash, email) VALUES (?, ?, ?)`,
+      [username, passwordHash, email],
+      function (err) {
+        if (err) {
+          console.error('Error inserting user:', err);
+          return res.status(500).json({ error: 'Failed to register user' });
+        }
+
+        // Respond with generated password
+        res.status(201).json({ password });
+      }
+    );
+  } catch (err) {
+    console.error('Error during registration:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
 });
 
-// Start server
-const server = app.listen(port, () => {
-  console.log(`Server started on http://localhost:${port}`);
+// Example Authentication Endpoint with Rate Limiting
+app.post('/auth', authRateLimiter, async (req, res) => {
+  const { username, password } = req.body;
+
+  if (!username || !password) {
+    await logAuthRequest(username || 'unknown', false);
+    return res.status(400).json({ error: 'Username and password are required' });
+  }
+
+  db.get(
+    `SELECT password_hash FROM users WHERE username = ?`,
+    [username],
+    async (err, row) => {
+      if (err) {
+        console.error('Database error during authentication:', err);
+        await logAuthRequest(username, false);
+        return res.status(500).json({ error: 'Internal server error' });
+      }
+
+      if (!row) {
+        await logAuthRequest(username, false);
+        return res.status(401).json({ error: 'Invalid username or password' });
+      }
+
+      try {
+        const passwordMatches = await argon2.verify(row.password_hash, password);
+
+        if (passwordMatches) {
+          await logAuthRequest(username, true);
+          const payload = { user: username, iat: Math.floor(Date.now() / 1000) };
+          fetchKeyFromDatabase(false, (err, keyRow) => {
+            if (err || !keyRow) {
+              return res.status(500).json({ error: 'No valid keys available' });
+            }
+
+            const token = jwt.sign(payload, keyRow.key, {
+              algorithm: 'RS256',
+              header: { typ: 'JWT', alg: 'RS256', kid: keyRow.kid },
+              expiresIn: 3600,
+            });
+
+            res.json({ token });
+          });
+        } else {
+          await logAuthRequest(username, false);
+          res.status(401).json({ error: 'Invalid username or password' });
+        }
+      } catch (err) {
+        console.error('Error verifying password:', err);
+        await logAuthRequest(username, false);
+        res.status(500).json({ error: 'Failed to authenticate user' });
+      }
+    }
+  );
 });
 
-// Export the app for testing
-module.exports = { app, server, storeKeysAtStartup };
+// Start the server
+app.listen(port, () => {
+  console.log(`JWKS server running on port ${port}`);
+  storeKeysAtStartup();
+});
+
+// Export app for testing
+module.exports = { app, db };
