@@ -69,6 +69,15 @@ const db = new sqlite3.Database(dbFilePath, (err) => {
         timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )`
     );
+    db.run(
+      `CREATE TABLE IF NOT EXISTS auth_logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        request_ip TEXT NOT NULL,
+        request_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        user_id INTEGER,
+        FOREIGN KEY(user_id) REFERENCES users(id)
+      )`
+    );
   }
 });
 
@@ -87,16 +96,17 @@ async function storeKeysAtStartup() {
   db.run(`INSERT INTO keys (key, exp) VALUES (?, ?)`, [encryptedExpiredKey, expiredExpiration]);
 }
 
-// Rate limiter for authentication
+// Rate limiter for authentication with 10 requests per second
 const authRateLimiter = rateLimit({
-  windowMs: 60 * 1000, // 1-minute window
-  max: 5, // Limit each IP to 5 requests per minute
+  windowMs: 1000,  // 1 second window
+  max: 10,         // Limit to 10 requests per second
   message: {
     error: 'Too many authentication attempts. Please try again later.',
   },
-  standardHeaders: true, // Return rate limit info in `RateLimit-*` headers
-  legacyHeaders: false, // Disable the `X-RateLimit-*` headers
+  standardHeaders: true,  // Return rate limit info in `RateLimit-*` headers
+  legacyHeaders: false,   // Disable the `X-RateLimit-*` headers
 });
+
 
 // Fetch Key from Database
 function fetchKeyFromDatabase(expired, callback) {
@@ -120,25 +130,6 @@ function fetchKeyFromDatabase(expired, callback) {
         callback(decryptErr, null);
       }
     }
-  });
-}
-
-// Log Authentication Request
-function logAuthRequest(username, success) {
-  return new Promise((resolve, reject) => {
-    db.run(
-      `INSERT INTO auth_requests (username, success) VALUES (?, ?)`,
-
-      [username, success ? 1 : 0],
-      function (err) {
-        if (err) {
-          console.error('Error logging authentication request:', err);
-          reject(err);
-        } else {
-          resolve();
-        }
-      }
-    );
   });
 }
 
@@ -185,24 +176,25 @@ app.post('/register', async (req, res) => {
 // Example Authentication Endpoint with Rate Limiting
 app.post('/auth', authRateLimiter, async (req, res) => {
   const { username, password } = req.body;
+  const requestIp = req.ip;  // Capture the IP address of the requester
 
   if (!username || !password) {
-    await logAuthRequest(username || 'unknown', false);
+    await logAuthRequest(username || 'unknown', false, requestIp);
     return res.status(400).json({ error: 'Username and password are required' });
   }
 
   db.get(
-    `SELECT password_hash FROM users WHERE username = ?`,
+    `SELECT id, password_hash FROM users WHERE username = ?`,
     [username],
     async (err, row) => {
       if (err) {
         console.error('Database error during authentication:', err);
-        await logAuthRequest(username, false);
+        await logAuthRequest(username, false, requestIp);
         return res.status(500).json({ error: 'Internal server error' });
       }
 
       if (!row) {
-        await logAuthRequest(username, false);
+        await logAuthRequest(username, false, requestIp);
         return res.status(401).json({ error: 'Invalid username or password' });
       }
 
@@ -210,7 +202,7 @@ app.post('/auth', authRateLimiter, async (req, res) => {
         const passwordMatches = await argon2.verify(row.password_hash, password);
 
         if (passwordMatches) {
-          await logAuthRequest(username, true);
+          await logAuthRequest(username, true, requestIp);
           const payload = { user: username, iat: Math.floor(Date.now() / 1000) };
           fetchKeyFromDatabase(false, (err, keyRow) => {
             if (err || !keyRow) {
@@ -226,17 +218,48 @@ app.post('/auth', authRateLimiter, async (req, res) => {
             res.json({ token });
           });
         } else {
-          await logAuthRequest(username, false);
+          await logAuthRequest(username, false, requestIp);
           res.status(401).json({ error: 'Invalid username or password' });
         }
       } catch (err) {
         console.error('Error verifying password:', err);
-        await logAuthRequest(username, false);
+        await logAuthRequest(username, false, requestIp);
         res.status(500).json({ error: 'Failed to authenticate user' });
       }
     }
   );
 });
+
+// Helper function to log authentication request to the `auth_logs` table
+function logAuthRequest(username, success, requestIp) {
+  return new Promise((resolve, reject) => {
+    db.get(
+      `SELECT id FROM users WHERE username = ?`,
+      [username],
+      (err, row) => {
+        if (err) {
+          console.error('Error fetching user ID:', err);
+          reject(err);
+        } else {
+          const userId = row ? row.id : null;  // Use user ID if found, otherwise null
+
+          db.run(
+            `INSERT INTO auth_logs (request_ip, user_id) VALUES (?, ?)`,
+            [requestIp, userId],
+            function (err) {
+              if (err) {
+                console.error('Error logging authentication request:', err);
+                reject(err);
+              } else {
+                resolve();
+              }
+            }
+          );
+        }
+      }
+    );
+  });
+}
 
 // Start the server
 app.listen(port, () => {
@@ -245,4 +268,4 @@ app.listen(port, () => {
 });
 
 // Export app for testing
-module.exports = { app, db };
+module.exports = { app, db, fetchKeyFromDatabase, storeKeysAtStartup, encryptKey, decryptKey };
