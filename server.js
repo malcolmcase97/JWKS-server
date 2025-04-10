@@ -252,6 +252,7 @@ function logAuthRequest(username, success, requestIp) {
                 reject(err);
               } else {
                 resolve();
+                
               }
             }
           );
